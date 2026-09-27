@@ -20,25 +20,43 @@ def resolve_sourceforge(raw_url: str):
 
     filename = os.path.basename(file_subpath)
     
-    direct_trigger = f"https://downloads.sourceforge.net/project/{project}/{file_subpath}?use_mirror=autoselect"
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": raw_url
-    }
-
+    # 1. Gọi JSON API chính thức của SourceForge để lấy danh sách Mirror thật
+    api_url = f"https://sourceforge.net/projects/{project}/files/{file_subpath}/json"
+    headers = {"User-Agent": ua, "Accept": "application/json"}
+    
+    mirror_urls = []
     try:
-        session = requests.Session()
-        resp = session.get(direct_trigger, headers=headers, allow_redirects=True, stream=True, timeout=25)
-        final_url = resp.url
-        if "dl.sourceforge.net" in final_url:
-            print(f"{final_url}|{filename}")
-            return
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Ưu tiên mirror tốt nhất do SourceForge đề xuất
+            default_mirror = data.get("default_merge")
+            if default_mirror:
+                mirror_urls.append(f"https://{default_mirror}.dl.sourceforge.net/project/{project}/{file_subpath}")
+            
+            # Lấy danh sách các mirror khác đang active
+            for item in data.get("repos", []):
+                m_short = item.get("short_name")
+                if m_short and m_short != default_mirror:
+                    mirror_urls.append(f"https://{m_short}.dl.sourceforge.net/project/{project}/{file_subpath}")
     except Exception:
         pass
 
-    fallback_mirror = f"https://zenlayer.dl.sourceforge.net/project/{project}/{file_subpath}"
-    print(f"{fallback_mirror}|{filename}")
+    # 2. Danh sách các mirror cố định dự phòng (bỏ qua zenlayer vì hay redirect ngược lại)
+    fallback_mirrors = [
+        f"https://cfhcable.dl.sourceforge.net/project/{project}/{file_subpath}",
+        f"https://jaist.dl.sourceforge.net/project/{project}/{file_subpath}",
+        f"https://netix.dl.sourceforge.net/project/{project}/{file_subpath}",
+        f"https://nchc.dl.sourceforge.net/project/{project}/{file_subpath}",
+        f"https://versaweb.dl.sourceforge.net/project/{project}/{file_subpath}"
+    ]
+
+    for fb in fallback_mirrors:
+        if fb not in mirror_urls:
+            mirror_urls.append(fb)
+
+    # In ra: filename|url1 url2 url3...
+    print(f"{filename}|{' '.join(mirror_urls)}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
