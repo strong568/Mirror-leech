@@ -33,28 +33,28 @@ if [[ "$SOURCE_URL" == *"drive.google.com"* || "$SOURCE_URL" == *"drive.usercont
 
 # ==================== 2. XỬ LÝ LINK SOURCEFORGE ====================
 elif [[ "$SOURCE_URL" == *"sourceforge.net"* ]]; then
-    echo "Phát hiện link SourceForge, đang truy vấn danh sách Mirror..."
+    echo "Phát hiện link SourceForge, đang giải mã direct link..."
     SF_INFO=$(python3 ../scripts/resolve_sf.py "$SOURCE_URL")
-    
+
     FILENAME=$(echo "$SF_INFO" | cut -d'|' -f1)
-    MIRROR_LIST=$(echo "$SF_INFO" | cut -d'|' -f2)
+    DIRECT_URL=$(echo "$SF_INFO" | cut -d'|' -f2)
 
-    echo "Target File : $FILENAME"
-    echo "Đang tải file từ danh sách Mirror khả dụng..."
+    echo "Target File: $FILENAME"
+    echo "Direct Link: $DIRECT_URL"
+    echo "Đang tải file về Runner bằng aria2c..."
 
-    # Truyền toàn bộ danh sách Mirror vào aria2c.
-    # Thêm cờ --max-file-not-found=5 để aria2c tự động bỏ qua mirror lỗi/redirect và nhảy sang mirror tiếp theo
     aria2c \
         --header="User-Agent: $USER_AGENT" \
+        --header="Referer: https://sourceforge.net/" \
         --check-certificate=false \
         --allow-overwrite=true \
         --auto-file-renaming=false \
-        --max-file-not-found=5 \
-        --max-connection-per-server=8 \
+        --max-connection-per-server=16 \
         --split=16 \
         --min-split-size=1M \
         -o "$FILENAME" \
-        $MIRROR_LIST
+        "$DIRECT_URL"
+
 
 
 # ==================== 3. CÁC LINK DIRECT KHÁC ====================
