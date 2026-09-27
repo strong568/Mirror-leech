@@ -22,7 +22,13 @@ if [[ "$SOURCE_URL" == *"drive.google.com"* || "$SOURCE_URL" == *"drive.usercont
         gdown --folder "$SOURCE_URL" --remaining-ok
     else
         echo "Link File Drive: Bắt đầu tải file..."
-        gdown "$SOURCE_URL" --fuzzy
+        # Tự động trích xuất File ID để tải ổn định nhất
+        FILE_ID=$(echo "$SOURCE_URL" | grep -oP '(id=|\/d\/)\K[a-zA-Z0-9_-]+' | head -n 1)
+        if [ -n "$FILE_ID" ]; then
+            gdown "https://drive.google.com/uc?id=${FILE_ID}"
+        else
+            gdown "$SOURCE_URL"
+        fi
     fi
 
 # ==================== 2. XỬ LÝ LINK SOURCEFORGE ====================
