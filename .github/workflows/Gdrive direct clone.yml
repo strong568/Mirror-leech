@@ -6,7 +6,6 @@ on:
       source_url:
         description: "Google Drive File hoặc Folder URL nguồn"
         required: true
-        # default: "https://drive.google.com/drive/folders/1R"
       dest_folder:
         description: "Tên thư mục đích trên Google Drive của bạn"
         required: false
@@ -261,3 +260,4 @@ jobs:
               echo "- Quá trình sao chép thất bại. Vui lòng kiểm tra quyền truy cập file hoặc cookie."
             } >> $GITHUB_STEP_SUMMARY
           fi
+          
