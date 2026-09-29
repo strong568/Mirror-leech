@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Install Tools
-        run: >
-          sudo apt update &&
-          sudo apt install -y aria2 curl jq &&
-          curl -s https://rclone.org/install.sh | sudo bash &&
+        run: |
+          sudo apt update
+          sudo apt install -y aria2 curl jq
+          curl -s https://rclone.org/install.sh | sudo bash
           pip3 install --no-cache-dir gdown
 
       - name: Clone / Copy to Google Drive
@@ -75,7 +75,6 @@ jobs:
               INPUT_NAME="$PAGE_TITLE"
             fi
           else
-            # Lấy tên Folder từ giao diện web Drive
             FOLDER_PAGE=$(curl -sL "https://drive.google.com/drive/folders/${TARGET_ID}")
             F_TITLE=$(echo "$FOLDER_PAGE" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
             [ -z "$F_TITLE" ] && F_TITLE=$(echo "$FOLDER_PAGE" | grep -oP '(?<=<title>).*?(?= - Google Drive</title>)' | head -n 1 || true)
@@ -86,7 +85,6 @@ jobs:
               INPUT_NAME="Folder_${TARGET_ID}"
             fi
 
-            # Đo dung lượng tổng của folder qua rclone size
             FOLDER_INFO=$(rclone size "gdrive,root_folder_id=${TARGET_ID}:" 2>/dev/null || true)
             if [ -n "$FOLDER_INFO" ]; then
               INPUT_SIZE=$(echo "$FOLDER_INFO" | grep -oP '(?<=Total size: ).*?(?= \()' | tr -d ' ' || true)
@@ -107,7 +105,6 @@ jobs:
           # 4. THỰC HIỆN SERVER-SIDE COPY
           echo "⚡ Đang nhân bản Server-Side..."
           if [ "$TARGET_KIND" = "FOLDER" ]; then
-            # GIỮ NGUYÊN TÊN THƯ MỤC NGUỒN: Copy vào Mirror-Leech/<Tên Thư Mục>
             TARGET_DEST_DIR="${DEST}/${INPUT_NAME}"
             rclone mkdir "gdrive:${TARGET_DEST_DIR}"
 
@@ -122,7 +119,6 @@ jobs:
             fi
           else
             ACTUAL_DEST_PATH="${DEST}"
-            # Với File: dùng token drive api trực tiếp
             ACCESS_TOKEN=$(rclone backend token gdrive: 2>/dev/null | jq -r '.access_token // empty')
             DEST_FOLDER_ID=$(rclone backend fileid gdrive: "${DEST}" 2>/dev/null | tr -d ' \n\r')
             if [ -z "$DEST_FOLDER_ID" ] \vert{}\vert{} [ "$DEST_FOLDER_ID" = "Root" ]; then
@@ -150,7 +146,6 @@ jobs:
               fi
             fi
 
-            # Fallback copyid
             if [ "$COPIED_SUCCESS" -ne 1 ]; then
               rclone backend copyid gdrive: "$TARGET_ID" "gdrive:${INPUT_NAME}" > copy.log 2>&1 || true
               if [ -s copy.log ] && ! grep -qiE "failed|error" copy.log; then
@@ -260,4 +255,3 @@ jobs:
               echo "- Quá trình sao chép thất bại. Vui lòng kiểm tra quyền truy cập file hoặc cookie."
             } >> $GITHUB_STEP_SUMMARY
           fi
-          
