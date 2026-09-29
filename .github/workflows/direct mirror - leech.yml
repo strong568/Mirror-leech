@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y aria2 curl jq
-          curl https://rclone.org/install.sh | sudo bash
+          curl -s https://rclone.org/install.sh | sudo bash
           pip install --no-cache-dir requests huggingface_hub gdown
 
       - name: Run Mirror & Upload Process
@@ -50,35 +50,126 @@ jobs:
           HF_REPO: ${{ inputs.huggingface_repo }}
           HF_REPO_TYPE: 'model'
           RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
           GDRIVE_DIR: ${{ inputs.gdrive_folder }}
         run: |
+          set -e
           mkdir -p downloads/
           cd downloads/
 
           USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
+          # Thiết lập cấu hình Rclone nếu có
+          HAS_RCLONE=0
+          if [ -n "${RCLONE_CONFIG_DATA:-}" ]; then
+            mkdir -p ~/.config/rclone
+            echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+            HAS_RCLONE=1
+          fi
+
+          # Thiết lập cookie Google Drive nếu có
+          COOKIE_ARGS=()
+          if [ -n "${GDRIVE_COOKIES:-}" ]; then
+            echo "$GDRIVE_COOKIES" > /tmp/gdrive_cookies.txt
+            COOKIE_ARGS=(--cookies /tmp/gdrive_cookies.txt)
+          fi
+
           echo "============================================="
-          echo "[1/3] Nhận diện và tải nguồn URL..."
+          echo "[1/3] Nhận diện và xử lý URL nguồn..."
           echo "============================================="
+
+          GDRIVE_SERVERSIDE_DONE=0
 
           if [[ "$SOURCE_URL" == *"drive.google.com"* || "$SOURCE_URL" == *"drive.usercontent.google.com"* ]]; then
               echo "Phát hiện link Google Drive..."
-              if [[ "$SOURCE_URL" == *"/folders/"* || "$SOURCE_URL" == *"folder"* ]]; then
-                  gdown --folder "$SOURCE_URL" --remaining-ok
+
+              # Bóc tách ID Drive
+              if echo "$SOURCE_URL" | grep -q "id="; then
+                TARGET_ID=$(echo "$SOURCE_URL" | grep -oP '(?<=id=)[a-zA-Z0-9_-]+')
+              elif echo "$SOURCE_URL" | grep -q "/d/"; then
+                TARGET_ID=$(echo "$SOURCE_URL" | grep -oP '(?<=/d/)[a-zA-Z0-9_-]+')
+              elif echo "$SOURCE_URL" | grep -q "/folders/"; then
+                TARGET_ID=$(echo "$SOURCE_URL" | grep -oP '(?<=/folders/)[a-zA-Z0-9_-]+')
               else
-                  FILE_ID=$(echo "$SOURCE_URL" | grep -oP '(id=|\/d\/)\K[a-zA-Z0-9_-]+' | head -n 1)
-                  if [ -n "$FILE_ID" ]; then
-                      gdown "https://drive.google.com/uc?id=${FILE_ID}"
-                  else
-                      gdown "$SOURCE_URL"
+                TARGET_ID="${SOURCE_URL##*/}"
+              fi
+              TARGET_ID=$(echo "$TARGET_ID" | tr -d ' \n\r')
+
+              case "$SOURCE_URL" in
+                *folder*) TARGET_KIND="FOLDER" ;;
+                *)        TARGET_KIND="FILE" ;;
+              esac
+
+              # Nếu có Rclone và KHÔNG yêu cầu tải lên HuggingFace, ưu tiên Server-Side tức thì
+              if [ "$HAS_RCLONE" -eq 1 ] && [ -z "${HF_TOKEN:-}" ]; then
+                echo "⚡ Chế độ trực tiếp: Đang nhân bản Google Drive Server-Side..."
+                rclone mkdir "gdrive:${GDRIVE_DIR}"
+                
+                if [ "$TARGET_KIND" = "FOLDER" ]; then
+                  FOLDER_PAGE=$(curl -sL "https://drive.google.com/drive/folders/${TARGET_ID}" || true)
+                  F_TITLE=$(echo "$FOLDER_PAGE" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
+                  [ -z "$F_TITLE" ] && F_TITLE="Folder_${TARGET_ID}"
+                  TARGET_DEST_DIR="${GDRIVE_DIR}/${F_TITLE}"
+
+                  if rclone copy "gdrive,root_folder_id=${TARGET_ID}:" "gdrive:${TARGET_DEST_DIR}" \
+                      --drive-server-side-across-configs \
+                      --drive-acknowledge-abuse \
+                      --transfers 8; then
+                    GDRIVE_SERVERSIDE_DONE=1
+                    ACTUAL_GDRIVE_DEST="${TARGET_DEST_DIR}"
                   fi
+                else
+                  PAGE_TITLE=$(curl -sL "https://drive.google.com/file/d/${TARGET_ID}/view" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
+                  [ -z "$PAGE_TITLE" ] && PAGE_TITLE="File_${TARGET_ID}"
+
+                  ACCESS_TOKEN=$(rclone backend token gdrive: 2>/dev/null | jq -r '.access_token // empty')
+                  DEST_FOLDER_ID=$(rclone backend fileid gdrive: "${GDRIVE_DIR}" 2>/dev/null | tr -d ' \n\r')
+                  if [ -z "$DEST_FOLDER_ID" ] || [ "$DEST_FOLDER_ID" = "Root" ]; then
+                    DEST_FOLDER_ID=$(rclone lsjson "gdrive:" --dirs-only 2>/dev/null | jq -r ".[] | select(.Path==\"${GDRIVE_DIR}\") | .ID" | head -n 1 | tr -d ' \n\r')
+                  fi
+
+                  if [ -n "$ACCESS_TOKEN" ]; then
+                    REQ_BODY=$(jq -n --arg pid "$DEST_FOLDER_ID" --arg name "$PAGE_TITLE" 'if $pid != "" and $pid != "Root" then {parents: [$pid], name: $name} else {name: $name} end')
+                    API_RESP=$(curl -s -X POST \
+                      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                      -H "Content-Type: application/json; charset=UTF-8" \
+                      -d "$REQ_BODY" \
+                      "https://www.googleapis.com/drive/v3/files/${TARGET_ID}/copy?supportsAllDrives=true")
+                    COPIED_FILE_ID=$(echo "$API_RESP" | jq -r '.id // empty')
+                    if [ -n "$COPIED_FILE_ID" ]; then
+                      GDRIVE_SERVERSIDE_DONE=1
+                      ACTUAL_GDRIVE_DEST="${GDRIVE_DIR}"
+                    fi
+                  fi
+
+                  if [ "$GDRIVE_SERVERSIDE_DONE" -ne 1 ]; then
+                    rclone backend copyid gdrive: "$TARGET_ID" "gdrive:${PAGE_TITLE}" > /tmp/copy.log 2>&1 || true
+                    if [ -s /tmp/copy.log ] && ! grep -qiE "failed|error" /tmp/copy.log; then
+                      rclone move "gdrive:${PAGE_TITLE}" "gdrive:${GDRIVE_DIR}/" 2>/dev/null || true
+                      GDRIVE_SERVERSIDE_DONE=1
+                      ACTUAL_GDRIVE_DEST="${GDRIVE_DIR}"
+                    fi
+                  fi
+                fi
+              fi
+
+              # Nếu chưa hoàn thành Server-Side (hoặc cần file tải về cho Hugging Face) -> Tải file về máy ảo
+              if [ "$GDRIVE_SERVERSIDE_DONE" -ne 1 ]; then
+                echo "📥 Đang tải dữ liệu từ Google Drive về runner..."
+                if [ "$TARGET_KIND" = "FOLDER" ]; then
+                  gdown --folder "https://drive.google.com/drive/folders/${TARGET_ID}" "${COOKIE_ARGS[@]}" || true
+                else
+                  PAGE_TITLE=$(curl -sL "https://drive.google.com/file/d/${TARGET_ID}/view" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
+                  [ -z "$PAGE_TITLE" ] && PAGE_TITLE="File_${TARGET_ID}"
+                  gdown "https://drive.google.com/uc?id=${TARGET_ID}" -O "$PAGE_TITLE" "${COOKIE_ARGS[@]}" || true
+                fi
               fi
 
           elif [[ "$SOURCE_URL" == *"sourceforge.net"* ]]; then
               echo "Phát hiện link SourceForge, đang lấy danh sách Mirror..."
 
               python3 - << 'EOF' > /tmp/sf_resolver.py
-import sys, os, requests
+import os, sys, requests
 from urllib.parse import urlparse
 
 raw_url = os.environ.get("SOURCE_URL", "")
@@ -160,8 +251,9 @@ EOF
           fi
 
           echo "============================================="
-          echo "[2/3] Kiểm tra file tải về..."
+          echo "[2/3] Kiểm tra tệp tin sau quá trình tải..."
           echo "============================================="
+          find . -maxdepth 1 -type f -name "download" -size -100k -delete 2>/dev/null || true
           ls -lh .
 
           echo "============================================="
@@ -172,9 +264,11 @@ EOF
           echo "| Dịch vụ | Đường dẫn tải xuống |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
 
+          # Upload Hugging Face (nếu có cấu hình)
           if [ -n "${HF_TOKEN:-}" ] && [ -n "${HF_REPO:-}" ]; then
-              echo ">> Upload lên Hugging Face: $HF_REPO..."
-              python3 - << 'PY'
+              if [ -n "$(ls -A . 2>/dev/null)" ]; then
+                  echo ">> Upload lên Hugging Face: $HF_REPO..."
+                  python3 - << 'PY'
 import os
 from huggingface_hub import HfApi
 
@@ -185,6 +279,8 @@ repo_type = os.environ.get("HF_REPO_TYPE", "model")
 for root, dirs, files in os.walk("."):
     for file in files:
         rel_path = os.path.relpath(os.path.join(root, file), ".")
+        if rel_path.startswith(".") or file == "download":
+            continue
         print(f"Uploading: {rel_path}")
         api.upload_file(
             path_or_fileobj=rel_path,
@@ -198,34 +294,47 @@ for root, dirs, files in os.walk("."):
 
 print("✅ Upload Hugging Face thành công!")
 PY
-
-              if [ -f "/tmp/hf_links.txt" ]; then
-                  while IFS='|' read -r fname link; do
-                      echo "::notice title=HuggingFace Link ($fname)::$link"
-                      echo "| Hugging Face ($fname) | [Tải xuống tại đây]($link) |" >> $GITHUB_STEP_SUMMARY
-                  done < /tmp/hf_links.txt
+                  if [ -f "/tmp/hf_links.txt" ]; then
+                      while IFS='|' read -r fname link; do
+                          echo "::notice title=HuggingFace Link ($fname)::$link"
+                          echo "| Hugging Face ($fname) | [Tải xuống tại đây]($link) |" >> $GITHUB_STEP_SUMMARY
+                      done < /tmp/hf_links.txt
+                  fi
               fi
           fi
 
-          if [ -n "${RCLONE_CONFIG_DATA:-}" ]; then
-              echo ">> Upload lên Google Drive qua Rclone..."
-              mkdir -p ~/.config/rclone
-              echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
-              
-              rclone copy . "gdrive:${GDRIVE_DIR:-Mirror-Leech}" \
-                  --progress \
-                  --drive-chunk-size 64M \
-                  --transfers 4
+          # Upload Google Drive (nếu chưa hoàn thành bằng Server-Side)
+          if [ "$HAS_RCLONE" -eq 1 ]; then
+              if [ "$GDRIVE_SERVERSIDE_DONE" -eq 1 ]; then
+                  echo ">> Liệt kê tệp tin từ Google Drive Server-Side..."
+                  rclone lsjson "gdrive:${ACTUAL_GDRIVE_DEST}" | jq -c '.[]' | while read -r item; do
+                      fname=$(echo "$item" | jq -r '.Name')
+                      is_dir=$(echo "$item" | jq -r '.IsDir')
+                      if [ "$is_dir" != "true" ]; then
+                          fid=$(rclone backend fileid gdrive: "${ACTUAL_GDRIVE_DEST}/${fname}" 2>/dev/null | tr -d ' \n\r')
+                          link="https://drive.google.com/file/d/${fid}/view?usp=sharing"
+                          echo "::notice title=Google Drive Link ($fname)::$link"
+                          echo "| Google Drive ($fname) | [Mở trên Google Drive]($link) |" >> $GITHUB_STEP_SUMMARY
+                      fi
+                  done
+              elif [ -n "$(ls -A . 2>/dev/null)" ]; then
+                  echo ">> Upload lên Google Drive qua Rclone..."
+                  rclone copy . "gdrive:${GDRIVE_DIR}" \
+                      --progress \
+                      --drive-chunk-size 64M \
+                      --transfers 4
 
-              for item in *; do
-                  [ -f "$item" ] || continue
-                  drive_link=$(rclone link "gdrive:${GDRIVE_DIR:-Mirror-Leech}/$item" 2>/dev/null || echo "")
-                  if [ -n "$drive_link" ]; then
-                      echo "::notice title=Google Drive Link ($item)::$drive_link"
-                      echo "| Google Drive ($item) | [Mở trên Google Drive]($drive_link) |" >> $GITHUB_STEP_SUMMARY
-                  fi
-              done
-              echo "✅ Upload Google Drive thành công!"
+                  find . -maxdepth 2 -type f | while read -r file; do
+                      rel_item="${file#./}"
+                      fid=$(rclone backend fileid gdrive: "${GDRIVE_DIR}/${rel_item}" 2>/dev/null | tr -d ' \n\r')
+                      if [ -n "$fid" ]; then
+                          link="https://drive.google.com/file/d/${fid}/view?usp=sharing"
+                          echo "::notice title=Google Drive Link ($rel_item)::$link"
+                          echo "| Google Drive ($rel_item) | [Mở trên Google Drive]($link) |" >> $GITHUB_STEP_SUMMARY
+                      fi
+                  done
+                  echo "✅ Upload Google Drive thành công!"
+              fi
           fi
 
           echo "🎉 Hoàn tất toàn bộ tiến trình!"
