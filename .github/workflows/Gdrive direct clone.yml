@@ -1,0 +1,263 @@
+name: GDrive Direct Clone
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Google Drive File hoặc Folder URL nguồn"
+        required: true
+        # default: "https://drive.google.com/drive/folders/1R"
+      dest_folder:
+        description: "Tên thư mục đích trên Google Drive của bạn"
+        required: false
+        default: "Mirror-Leech"
+
+jobs:
+  server_side_clone:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Tools
+        run: >
+          sudo apt update &&
+          sudo apt install -y aria2 curl jq &&
+          curl -s https://rclone.org/install.sh | sudo bash &&
+          pip3 install --no-cache-dir gdown
+
+      - name: Clone / Copy to Google Drive
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
+        run: |
+          set -e
+          echo "🚀 Bắt đầu quy trình sao chép Google Drive..."
+
+          if [ -z "${RCLONE_CONFIG_DATA:-}" ]; then
+            echo "❌ Lỗi: Chưa cấu hình Secrets RCLONE_CONFIG!"
+            exit 1
+          fi
+
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+
+          RAW_URL="${{ github.event.inputs.source_url }}"
+          DEST="${{ github.event.inputs.dest_folder }}"
+
+          # 1. Trích xuất ID chuẩn
+          if echo "$RAW_URL" | grep -q "id="; then
+            TARGET_ID=$(echo "$RAW_URL" | grep -oP '(?<=id=)[a-zA-Z0-9_-]+')
+          elif echo "$RAW_URL" | grep -q "/d/"; then
+            TARGET_ID=$(echo "$RAW_URL" | grep -oP '(?<=/d/)[a-zA-Z0-9_-]+')
+          elif echo "$RAW_URL" | grep -q "/folders/"; then
+            TARGET_ID=$(echo "$RAW_URL" | grep -oP '(?<=/folders/)[a-zA-Z0-9_-]+')
+          else
+            TARGET_ID="${RAW_URL##*/}"
+          fi
+          TARGET_ID=$(echo "$TARGET_ID" | tr -d ' \n\r')
+
+          case "$RAW_URL" in
+            *folder*) TARGET_KIND="FOLDER" ;;
+            *)        TARGET_KIND="FILE" ;;
+          esac
+
+          echo "🔍 Loại nguồn: $TARGET_KIND"
+          echo "📂 Drive ID nguồn: $TARGET_ID"
+
+          # 2. LẤY TÊN VÀ DUNG LƯỢNG NGUỒN CHUẨN XÁC
+          INPUT_NAME=""
+          INPUT_SIZE=""
+
+          if [ "$TARGET_KIND" = "FILE" ]; then
+            DL_PAGE=$(curl -sL "https://drive.usercontent.google.com/download?id=${TARGET_ID}&export=download")
+            INPUT_SIZE=$(echo "$DL_PAGE" | grep -oP '\([0-9.,]+\s*[KMGTP]?i?B?\)' | tr -d '()' | head -n 1 || true)
+
+            PAGE_TITLE=$(curl -sL "https://drive.google.com/file/d/${TARGET_ID}/view" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
+            if [ -n "$PAGE_TITLE" ]; then
+              INPUT_NAME="$PAGE_TITLE"
+            fi
+          else
+            # Lấy tên Folder từ giao diện web Drive
+            FOLDER_PAGE=$(curl -sL "https://drive.google.com/drive/folders/${TARGET_ID}")
+            F_TITLE=$(echo "$FOLDER_PAGE" | grep -oP '(?<=<meta property="og:title" content=").*?(?=")' | head -n 1 || true)
+            [ -z "$F_TITLE" ] && F_TITLE=$(echo "$FOLDER_PAGE" | grep -oP '(?<=<title>).*?(?= - Google Drive</title>)' | head -n 1 || true)
+            
+            if [ -n "$F_TITLE" ]; then
+              INPUT_NAME="$F_TITLE"
+            else
+              INPUT_NAME="Folder_${TARGET_ID}"
+            fi
+
+            # Đo dung lượng tổng của folder qua rclone size
+            FOLDER_INFO=$(rclone size "gdrive,root_folder_id=${TARGET_ID}:" 2>/dev/null || true)
+            if [ -n "$FOLDER_INFO" ]; then
+              INPUT_SIZE=$(echo "$FOLDER_INFO" | grep -oP '(?<=Total size: ).*?(?= \()' | tr -d ' ' || true)
+            fi
+          fi
+
+          [ -z "$INPUT_NAME" ] && INPUT_NAME="${TARGET_KIND}_${TARGET_ID}"
+          [ -z "$INPUT_SIZE" ] && INPUT_SIZE="Không xác định"
+
+          echo "📄 Tên nguồn phát hiện: $INPUT_NAME"
+          echo "📦 Dung lượng nguồn: $INPUT_SIZE"
+
+          # 3. Tạo thư mục đích cơ sở
+          rclone mkdir "gdrive:${DEST}"
+
+          COPIED_SUCCESS=0
+
+          # 4. THỰC HIỆN SERVER-SIDE COPY
+          echo "⚡ Đang nhân bản Server-Side..."
+          if [ "$TARGET_KIND" = "FOLDER" ]; then
+            # GIỮ NGUYÊN TÊN THƯ MỤC NGUỒN: Copy vào Mirror-Leech/<Tên Thư Mục>
+            TARGET_DEST_DIR="${DEST}/${INPUT_NAME}"
+            rclone mkdir "gdrive:${TARGET_DEST_DIR}"
+
+            if rclone copy "gdrive,root_folder_id=${TARGET_ID}:" "gdrive:${TARGET_DEST_DIR}" \
+                --drive-server-side-across-configs \
+                --drive-acknowledge-abuse \
+                --progress \
+                --transfers 8; then
+              COPIED_SUCCESS=1
+              METHOD_USED="Server-Side Direct (Folder)"
+              ACTUAL_DEST_PATH="${TARGET_DEST_DIR}"
+            fi
+          else
+            ACTUAL_DEST_PATH="${DEST}"
+            # Với File: dùng token drive api trực tiếp
+            ACCESS_TOKEN=$(rclone backend token gdrive: 2>/dev/null | jq -r '.access_token // empty')
+            DEST_FOLDER_ID=$(rclone backend fileid gdrive: "${DEST}" 2>/dev/null | tr -d ' \n\r')
+            if [ -z "$DEST_FOLDER_ID" ] \vert{}\vert{} [ "$DEST_FOLDER_ID" = "Root" ]; then
+              DEST_FOLDER_ID=$(rclone lsjson "gdrive:" --dirs-only 2>/dev/null | jq -r ".[] | select(.Path==\"${DEST}\") | .ID" | head -n 1 | tr -d ' \n\r')
+            fi
+
+            if [ -n "$ACCESS_TOKEN" ]; then
+              if [ -n "$DEST_FOLDER_ID" ] && [ "$DEST_FOLDER_ID" != "Root" ]; then
+                REQ_BODY=$(jq -n --arg pid "$DEST_FOLDER_ID" --arg name "$INPUT_NAME" '{parents: [$pid], name:$name}')
+              else
+                REQ_BODY=$(jq -n --arg name "$INPUT_NAME" '{name: $name}')
+              fi
+
+              API_RESP=$(curl -s -X POST \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                -H "Content-Type: application/json; charset=UTF-8" \
+                -d "$REQ_BODY" \
+                "https://www.googleapis.com/drive/v3/files/${TARGET_ID}/copy?supportsAllDrives=true")
+
+              COPIED_FILE_ID=$(echo "$API_RESP" | jq -r '.id // empty')
+              if [ -n "$COPIED_FILE_ID" ]; then
+                COPIED_SUCCESS=1
+                METHOD_USED="Server-Side Direct (Drive API Copy)"
+                echo "🎉 Nhân bản thành công tức thì với File ID: $COPIED_FILE_ID"
+              fi
+            fi
+
+            # Fallback copyid
+            if [ "$COPIED_SUCCESS" -ne 1 ]; then
+              rclone backend copyid gdrive: "$TARGET_ID" "gdrive:${INPUT_NAME}" > copy.log 2>&1 || true
+              if [ -s copy.log ] && ! grep -qiE "failed|error" copy.log; then
+                rclone move "gdrive:${INPUT_NAME}" "gdrive:${DEST}/" 2>/dev/null || true
+                COPIED_SUCCESS=1
+                METHOD_USED="Server-Side Direct (rclone copyid)"
+              fi
+            fi
+          fi
+
+          # 5. Fallback tải qua máy ảo nếu bị chặn Server-Side
+          if [ "$COPIED_SUCCESS" -eq 1 ]; then
+            echo "🎉 Hoàn tất sao chép Server-Side vào ${ACTUAL_DEST_PATH}!"
+          else
+            echo "⚠️ Không thể copy Server-Side, chuyển sang gdown..."
+            METHOD_USED="gdown Download & Upload"
+            mkdir -p temp_transfer
+            cd temp_transfer
+
+            COOKIE_ARGS=()
+            if [ -n "${GDRIVE_COOKIES:-}" ]; then
+              echo "$GDRIVE_COOKIES" > ../cookies_auth.txt
+              COOKIE_ARGS=(--cookies ../cookies_auth.txt)
+            fi
+
+            if [ "$TARGET_KIND" = "FOLDER" ]; then
+              gdown --folder "https://drive.google.com/drive/folders/${TARGET_ID}" "${COOKIE_ARGS[@]}" || true
+              ACTUAL_DEST_PATH="${DEST}/${INPUT_NAME}"
+            else
+              gdown "https://drive.google.com/uc?id=${TARGET_ID}" -O "${INPUT_NAME}" "${COOKIE_ARGS[@]}" || true
+              ACTUAL_DEST_PATH="${DEST}"
+            fi
+            cd ..
+
+            find ./temp_transfer -maxdepth 1 -type f -name "download" -size -100k -delete 2>/dev/null || true
+
+            if [ -z "$(ls -A ./temp_transfer 2>/dev/null)" ]; then
+              echo "❌ Không tải được file từ link nguồn!"
+              exit 1
+            fi
+
+            echo "🚀 Đang upload file vào Google Drive (${ACTUAL_DEST_PATH})..."
+            rclone copy ./temp_transfer "gdrive:${ACTUAL_DEST_PATH}" --progress --drive-chunk-size 64M --transfers 4
+            rm -rf ./temp_transfer
+          fi
+
+          # 6. Xuất báo cáo tóm tắt
+          set +e
+          DEST_LINK=$(rclone link "gdrive:${ACTUAL_DEST_PATH}" 2>/dev/null)
+          rclone lsjson "gdrive:${ACTUAL_DEST_PATH}" | jq '[.[] | select(.Name != "cookies.txt" and .Name != "download")]' > dest_files.json 2>/dev/null
+
+          OUTPUT_FILE="summary_output.md"
+          > "$OUTPUT_FILE"
+
+          ITEMS_COUNT=$(jq 'length' dest_files.json 2>/dev/null || echo 0)
+          if [ "$ITEMS_COUNT" -gt 0 ]; then
+            for i in $(seq 0$((ITEMS_COUNT - 1))); do
+              FNAME=$(jq -r ".[$i].Name" dest_files.json)
+              FSIZE_B=$(jq -r ".[$i].Size" dest_files.json)
+              IS_DIR=$(jq -r ".[$i].IsDir" dest_files.json)
+              if [ "$IS_DIR" = "true" ]; then                 echo "- 📁 **${FNAME}** (Thư mục con)" >> "$OUTPUT_FILE"
+              else
+                FSIZE=$(numfmt --to=iec-i --suffix=B --format="\%.2f" "$FSIZE_B" 2>/dev/null)
+                FID=$(rclone backend fileid gdrive: "${ACTUAL_DEST_PATH}/${FNAME}" 2>/dev/null | tr -d ' \n\r')
+                if [ -n "$FID" ]; then
+                  echo "- 📄 **${FNAME}** (${FSIZE}) - [👉 Mở file trên Drive](https://drive.google.com/file/d/${FID}/view?usp=sharing)" >> "$OUTPUT_FILE"
+                else
+                  echo "- 📄 **${FNAME}** (${FSIZE})" >> "$OUTPUT_FILE"
+                fi
+              fi
+            done
+          fi
+
+          echo "INPUT_NAME=${INPUT_NAME}" >> $GITHUB_ENV
+          echo "INPUT_SIZE=${INPUT_SIZE}" >> $GITHUB_ENV
+          echo "DEST_LINK=${DEST_LINK}" >> $GITHUB_ENV
+          echo "ACTUAL_DEST_PATH=${ACTUAL_DEST_PATH}" >> $GITHUB_ENV
+          echo "METHOD_USED=${METHOD_USED}" >> $GITHUB_ENV
+          set -e
+
+      - name: Workflow Summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            {
+              echo "### ✅ Hoàn tất sao chép sang Google Drive"
+              echo ""
+              echo "#### 📥 Nguồn (Input):"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- **Tên nguồn:** \`${INPUT_NAME}\`"
+              echo "- **Dung lượng tổng:** \`${INPUT_SIZE}\`"
+              echo "- **Phương thức áp dụng:** \`${METHOD_USED}\`"
+              echo ""
+              echo "#### 📤 Đích đến (Output):"
+              echo "- **Thư mục lưu trữ:** \`${ACTUAL_DEST_PATH}\`"
+              if [ -n "${DEST_LINK:-}" ]; then
+                echo "- **Link thư mục:** [Mở thư mục đích](${DEST_LINK})"
+              fi
+              echo ""
+              echo "##### 📄 Danh sách file/thư mục bên trong:"
+              cat summary_output.md 2>/dev/null || echo "Không có file nào."
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            {
+              echo "### ❌ Thao tác thất bại"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- Quá trình sao chép thất bại. Vui lòng kiểm tra quyền truy cập file hoặc cookie."
+            } >> $GITHUB_STEP_SUMMARY
+          fi
