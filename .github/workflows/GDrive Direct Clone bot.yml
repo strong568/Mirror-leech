@@ -176,55 +176,7 @@ jobs:
               echo "- File bị khóa bản quyền gắt gao hoặc tài khoản Drive đích không còn đủ dung lượng trống."
             } >> $GITHUB_STEP_SUMMARY
           fi
-       fileId=file_id,
-                          body=body,
-                          supportsAllDrives=True,
-                          fields="id, name, size"
-                      ).execute()
-                  except HttpError as e:
-                      if e.resp.status in [403, 429]:
-                          print(f"⚠️ Phát hiện giới hạn hạn mức (Quota/Rate limit 403): {e.reason}")
-                          if not file_name:
-                              meta = self.get_metadata(file_id)
-                              file_name = meta.get("name", "unnamed_file")
-                          return self.download_and_upload_fallback(file_id, file_name, dest_id)
-                      raise e
-
-              def clone_folder(self, folder_name, folder_id, dest_parent_id):
-                  print(f"📁 Bắt đầu duyệt thư mục: {folder_name}")
-                  items = self.get_files_in_folder(folder_id)
-                  for item in items:
-                      if item.get("mimeType") == G_DRIVE_DIR_MIME_TYPE:
-                          self.total_folders += 1
-                          sub_folder_id = self.create_directory(item.get("name"), dest_parent_id)
-                          self.clone_folder(item.get("name"), item.get("id"), sub_folder_id)
-                      else:
-                          self.total_files += 1
-                          copied = self.copy_file_safe(item.get("id"), dest_parent_id, item.get("name"))
-                          file_size = int(copied.get("size") or item.get("size") or 0)
-                          self.total_bytes += file_size
-                          self.file_details.append((copied.get("name"), file_size, copied.get("id")))
-                          print(f"  └─ Đã sao chép: {copied.get('name')} ({human_readable_size(file_size)})")
-
-              def clone(self, source_url, dest_folder_input):
-                  target_id = extract_id(source_url)
-                  meta = self.get_metadata(target_id)
-                  mime_type = meta.get("mimeType")
-                  name = meta.get("name")
-
-                  dest_id = self.get_or_create_destination(dest_folder_input)
-
-                  if mime_type == G_DRIVE_DIR_MIME_TYPE:
-                      dest_dir_id = self.create_directory(name, dest_id)
-                      self.clone_folder(name, target_id, dest_dir_id)
-                      final_dest_id = dest_dir_id
-                  else:
-                      self.total_files = 1
-                      copied = self.copy_file_safe(target_id, dest_id, name)
-                      file_size = int(copied.get("size") or meta.get("size") or 0)
-                      self.total_bytes += file_size
-                      self.file_details.append((copied.get("name"), file_size, copied.get("id")))
-                      final_dest_id = dest_id
+                     final_dest_id = dest_id
 
                   return name, final_dest_id
 
