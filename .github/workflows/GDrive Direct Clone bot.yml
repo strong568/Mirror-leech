@@ -6,7 +6,7 @@ on:
       source_url:
         description: "Google Drive File hoặc Folder URL nguồn"
         required: true
-      dest_folder:
+        dest_folder:
         description: "Tên thư mục đích trên Google Drive của bạn (VD: Mirror-Leech hoặc ID thư mục)"
         required: false
         default: "Mirror-Leech"
@@ -25,13 +25,13 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y curl jq
-          curl -s https://rclone.org/install.sh | sudo bash
           pip install --no-cache-dir \
             google-api-python-client \
+            google-auth \
             google-auth-httplib2 \
             google-auth-oauthlib \
             tenacity \
-            gdown
+            requests
 
       - name: Thiết lập cấu hình Rclone
         env:
@@ -43,8 +43,6 @@ jobs:
           fi
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
-          # Chạy lệnh mồi để rclone tự làm mới và ghi access_token còn hạn vào file config
-          rclone about gdrive: >/dev/null 2>&1 || true
 
       - name: Chạy Script Python Clone (Server-side API)
         env:
@@ -57,33 +55,14 @@ jobs:
           import re
           import sys
           import json
-          import time
-          import subprocess
-          from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+          import configparser
           from googleapiclient.discovery import build
           from googleapiclient.errors import HttpError
           from google.oauth2.credentials import Credentials
           from google.oauth2 import service_account
+          from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
           G_DRIVE_DIR_MIME_TYPE = "application/vnd.google-apps.folder"
-
-          def parse_rclone_conf_token():
-              conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
-              if not os.path.exists(conf_path):
-                  raise FileNotFoundError("Không tìm thấy file ~/.config/rclone/rclone.conf")
-              
-              token_str = None
-              with open(conf_path, "r", encoding="utf-8") as f:
-                  for line in f:
-                      line = line.strip()
-                      if line.startswith("token ="):
-                          token_str = line.split("token =", 1)[1].strip()
-                          break
-              
-              if not token_str:
-                  raise ValueError("Không tìm thấy trường 'token' trong file cấu hình rclone!")
-              
-              return json.loads(token_str).get("access_token")
 
           def get_drive_service():
               # 1. Ưu tiên kiểm tra nếu có Service Account JSON
@@ -94,32 +73,64 @@ jobs:
                       creds = service_account.Credentials.from_service_account_info(
                           sa_info, scopes=['https://www.googleapis.com/auth/drive']
                       )
+                      print("🔑 Xác thực thành công bằng Service Account JSON.")
                       return build('drive', 'v3', credentials=creds)
                   except Exception as e:
-                      print(f"⚠️ Không thể xác thực bằng SA: {e}")
+                      print(f"⚠️ Không thể xác thực bằng SA: {e}. Đang chuyển sang đọc rclone.conf...")
 
-              # 2. Làm mới token bằng rclone và trích xuất access_token
-              print("🔑 Đang đồng bộ và trích xuất Access Token từ Rclone...")
-              try:
-                  subprocess.run(["rclone", "about", "gdrive:"], capture_output=True, text=True, check=True)
-              except subprocess.CalledProcessError as e:
-                  print(f"⚠️ Cảnh báo rclone about: {e.stderr}")
+              # 2. Đọc rclone.conf và cấu hình Google Auth Credentials tự refresh
+              conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
+              if not os.path.exists(conf_path):
+                  raise FileNotFoundError(f"Không tìm thấy file cấu hình tại {conf_path}")
 
-              access_token = parse_rclone_conf_token()
-              if not access_token:
-                  raise ValueError("Không thể lấy access_token hợp lệ từ cấu hình rclone!")
+              config = configparser.ConfigParser()
+              config.read(conf_path, encoding="utf-8")
 
-              creds = Credentials(token=access_token)
+              # Tìm remote Google Drive đầu tiên hoặc có tên 'gdrive'
+              remote_name = "gdrive" if "gdrive" in config else None
+              if not remote_name:
+                  for section in config.sections():
+                      if config[section].get("type") == "drive":
+                          remote_name = section
+                          break
+
+              if not remote_name:
+                  raise ValueError("Không tìm thấy remote Google Drive (type = drive) trong rclone.conf!")
+
+              sec = config[remote_name]
+              token_str = sec.get("token")
+              if not token_str:
+                  raise ValueError(f"Không tìm thấy trường 'token' trong section [{remote_name}]")
+
+              token_data = json.loads(token_str)
+              refresh_token = token_data.get("refresh_token")
+              access_token = token_data.get("access_token")
+              client_id = sec.get("client_id")
+              client_secret = sec.get("client_secret")
+
+              print(f"🔑 Đã đọc thông tin OAuth từ remote [{remote_name}].")
+
+              creds = Credentials(
+                  token=access_token,
+                  refresh_token=refresh_token,
+                  token_uri="https://oauth2.googleapis.com/token",
+                  client_id=client_id,
+                  client_secret=client_secret,
+                  scopes=['https://www.googleapis.com/auth/drive']
+              )
+
               return build('drive', 'v3', credentials=creds)
 
           def extract_id(url):
-              match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
+              url = url.strip()
+              match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
               if match:
                   return match.group(1)
               match = re.search(r'/(?:folders|file/d|d)/([a-zA-Z0-9_-]+)', url)
               if match:
                   return match.group(1)
-              return url.strip().split('/')[-1]
+              clean_url = url.split('?')[0].rstrip('/')
+              return clean_url.split('/')[-1]
 
           def human_readable_size(size_bytes):
               if size_bytes == 0:
@@ -203,6 +214,7 @@ jobs:
                   wait=wait_exponential(multiplier=2, min=3, max=8),
                   stop=stop_after_attempt(5),
                   retry=retry_if_exception_type(Exception),
+                  reraise=True
               )
               def copy_file(self, file_id, dest_id):
                   body = {'parents': [dest_id]}
@@ -258,7 +270,7 @@ jobs:
               service = get_drive_service()
               cloner = DriveCloner(service)
 
-              print("🚀 Đang chạy Server-Side Clone qua Google Drive API...")
+              print("🚀 Bắt đầu nhân bản Server-Side qua Google Drive API...")
               name, final_dest_id = cloner.clone(source_url, dest_folder)
 
               with open("summary_output.md", "w", encoding="utf-8") as f:
@@ -303,6 +315,6 @@ jobs:
             {
               echo "### ❌ Thao tác sao chép thất bại"
               echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
-              echo "- Kiểm tra lại quyền truy cập link nguồn, quota Drive API hoặc nội dung secret \`RCLONE_CONFIG\`."
+              echo "- Kiểm tra lại quyền xem của link nguồn, dung lượng trống của tài khoản đích hoặc thông tin trong Secret \`RCLONE_CONFIG\`."
             } >> $GITHUB_STEP_SUMMARY
           fi
