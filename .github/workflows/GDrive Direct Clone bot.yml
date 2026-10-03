@@ -6,7 +6,7 @@ on:
       source_url:
         description: "Google Drive File hoặc Folder URL nguồn"
         required: true
-        dest_folder:
+      dest_folder:
         description: "Tên thư mục đích trên Google Drive của bạn (VD: Mirror-Leech hoặc ID thư mục)"
         required: false
         default: "Mirror-Leech"
