@@ -31,7 +31,8 @@ jobs:
             google-auth-httplib2 \
             google-auth-oauthlib \
             tenacity \
-            requests
+            requests \
+            gdown
 
       - name: Thiết lập cấu hình Rclone
         env:
@@ -44,20 +45,22 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
 
-      - name: Chạy Script Python Clone (Server-side API)
+      - name: Chạy Script Python Clone (Server-side + Fallback Bypass)
         env:
-          SA_JSON_DATA: ${{ secrets.GDRIVE_SA_JSON }} # Tùy chọn nếu dùng Service Account
+          SA_JSON_DATA: ${{ secrets.GDRIVE_SA_JSON }}
           SOURCE_URL: ${{ github.event.inputs.source_url }}
           DEST_FOLDER: ${{ github.event.inputs.dest_folder }}
         run: |
           cat << 'EOF' > clone_runner.py
           import os
           import re
+          import io
           import sys
           import json
           import configparser
           from googleapiclient.discovery import build
           from googleapiclient.errors import HttpError
+          from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
           from google.oauth2.credentials import Credentials
           from google.oauth2 import service_account
           from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
@@ -65,7 +68,6 @@ jobs:
           G_DRIVE_DIR_MIME_TYPE = "application/vnd.google-apps.folder"
 
           def get_drive_service():
-              # 1. Ưu tiên kiểm tra nếu có Service Account JSON
               sa_json = os.environ.get("SA_JSON_DATA")
               if sa_json and sa_json.strip():
                   try:
@@ -73,12 +75,11 @@ jobs:
                       creds = service_account.Credentials.from_service_account_info(
                           sa_info, scopes=['https://www.googleapis.com/auth/drive']
                       )
-                      print("🔑 Xác thực thành công bằng Service Account JSON.")
+                      print("🔑 Đã xác thực bằng Service Account JSON.")
                       return build('drive', 'v3', credentials=creds)
                   except Exception as e:
-                      print(f"⚠️ Không thể xác thực bằng SA: {e}. Đang chuyển sang đọc rclone.conf...")
+                      print(f"⚠️ Thất bại khi đọc SA: {e}. Đang chuyển sang rclone.conf...")
 
-              # 2. Đọc rclone.conf và cấu hình Google Auth Credentials tự refresh
               conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
               if not os.path.exists(conf_path):
                   raise FileNotFoundError(f"Không tìm thấy file cấu hình tại {conf_path}")
@@ -86,7 +87,6 @@ jobs:
               config = configparser.ConfigParser()
               config.read(conf_path, encoding="utf-8")
 
-              # Tìm remote Google Drive đầu tiên hoặc có tên 'gdrive'
               remote_name = "gdrive" if "gdrive" in config else None
               if not remote_name:
                   for section in config.sections():
@@ -103,19 +103,12 @@ jobs:
                   raise ValueError(f"Không tìm thấy trường 'token' trong section [{remote_name}]")
 
               token_data = json.loads(token_str)
-              refresh_token = token_data.get("refresh_token")
-              access_token = token_data.get("access_token")
-              client_id = sec.get("client_id")
-              client_secret = sec.get("client_secret")
-
-              print(f"🔑 Đã đọc thông tin OAuth từ remote [{remote_name}].")
-
               creds = Credentials(
-                  token=access_token,
-                  refresh_token=refresh_token,
+                  token=token_data.get("access_token"),
+                  refresh_token=token_data.get("refresh_token"),
                   token_uri="https://oauth2.googleapis.com/token",
-                  client_id=client_id,
-                  client_secret=client_secret,
+                  client_id=sec.get("client_id"),
+                  client_secret=sec.get("client_secret"),
                   scopes=['https://www.googleapis.com/auth/drive']
               )
 
@@ -210,20 +203,56 @@ jobs:
                           break
                   return files
 
-              @retry(
-                  wait=wait_exponential(multiplier=2, min=3, max=8),
-                  stop=stop_after_attempt(5),
-                  retry=retry_if_exception_type(Exception),
-                  reraise=True
-              )
-              def copy_file(self, file_id, dest_id):
-                  body = {'parents': [dest_id]}
-                  return self.service.files().copy(
-                      fileId=file_id,
+              def download_and_upload_fallback(self, file_id, file_name, dest_id):
+                  """Tải và upload qua mạng VM khi Google chặn API copy trực tiếp"""
+                  print(f"  ⚡ File bị dính Rate Limit, kích hoạt chế độ Relay Download -> Upload qua VM...")
+                  temp_path = f"/tmp/{file_id}"
+                  
+                  # Tải file từ Google Drive về máy ảo
+                  request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                  with open(temp_path, "wb") as fh:
+                      downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
+                      done = False
+                      while not done:
+                          status, done = downloader.next_chunk()
+                          if status:
+                              print(f"     [Tải về] {int(status.progress() * 100)}%", end="\r")
+
+                  print("\n     [Tải về] Hoàn tất. Đang đẩy lên thư mục đích...")
+                  
+                  # Upload file lên thư mục đích
+                  media = MediaIoBaseUpload(open(temp_path, 'rb'), mimetype='application/octet-stream', resumable=True)
+                  body = {'name': file_name, 'parents': [dest_id]}
+                  uploaded = self.service.files().create(
                       body=body,
-                      supportsAllDrives=True,
-                      fields="id, name, size"
+                      media_body=media,
+                      fields='id, name, size',
+                      supportsAllDrives=True
                   ).execute()
+
+                  if os.path.exists(temp_path):
+                      os.remove(temp_path)
+
+                  return uploaded
+
+              def copy_file_safe(self, file_id, dest_id, file_name=None):
+                  # Thử Server-Side Copy trước
+                  try:
+                      body = {'parents': [dest_id]}
+                      return self.service.files().copy(
+                          fileId=file_id,
+                          body=body,
+                          supportsAllDrives=True,
+                          fields="id, name, size"
+                      ).execute()
+                  except HttpError as e:
+                      if e.resp.status in [403, 429]:
+                          print(f"⚠️ Phát hiện giới hạn hạn mức (Quota/Rate limit 403): {e.reason}")
+                          if not file_name:
+                              meta = self.get_metadata(file_id)
+                              file_name = meta.get("name", "unnamed_file")
+                          return self.download_and_upload_fallback(file_id, file_name, dest_id)
+                      raise e
 
               def clone_folder(self, folder_name, folder_id, dest_parent_id):
                   print(f"📁 Bắt đầu duyệt thư mục: {folder_name}")
@@ -235,8 +264,8 @@ jobs:
                           self.clone_folder(item.get("name"), item.get("id"), sub_folder_id)
                       else:
                           self.total_files += 1
-                          copied = self.copy_file(item.get("id"), dest_parent_id)
-                          file_size = int(item.get("size", 0))
+                          copied = self.copy_file_safe(item.get("id"), dest_parent_id, item.get("name"))
+                          file_size = int(copied.get("size") or item.get("size") or 0)
                           self.total_bytes += file_size
                           self.file_details.append((copied.get("name"), file_size, copied.get("id")))
                           print(f"  └─ Đã sao chép: {copied.get('name')} ({human_readable_size(file_size)})")
@@ -255,9 +284,9 @@ jobs:
                       final_dest_id = dest_dir_id
                   else:
                       self.total_files = 1
-                      copied = self.copy_file(target_id, dest_id)
-                      file_size = int(meta.get("size", 0))
-                      self.total_bytes = file_size
+                      copied = self.copy_file_safe(target_id, dest_id, name)
+                      file_size = int(copied.get("size") or meta.get("size") or 0)
+                      self.total_bytes += file_size
                       self.file_details.append((copied.get("name"), file_size, copied.get("id")))
                       final_dest_id = dest_id
 
@@ -270,7 +299,7 @@ jobs:
               service = get_drive_service()
               cloner = DriveCloner(service)
 
-              print("🚀 Bắt đầu nhân bản Server-Side qua Google Drive API...")
+              print("🚀 Bắt đầu nhân bản Google Drive...")
               name, final_dest_id = cloner.clone(source_url, dest_folder)
 
               with open("summary_output.md", "w", encoding="utf-8") as f:
@@ -295,7 +324,7 @@ jobs:
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             {
-              echo "### ✅ Hoàn tất sao chép sang Google Drive (Server-Side Direct)"
+              echo "### ✅ Hoàn tất sao chép sang Google Drive"
               echo ""
               echo "#### 📥 Nguồn (Input):"
               echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
@@ -315,6 +344,6 @@ jobs:
             {
               echo "### ❌ Thao tác sao chép thất bại"
               echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
-              echo "- Kiểm tra lại quyền xem của link nguồn, dung lượng trống của tài khoản đích hoặc thông tin trong Secret \`RCLONE_CONFIG\`."
+              echo "- Vui lòng kiểm tra lại quyền truy cập hoặc dung lượng trống tài khoản."
             } >> $GITHUB_STEP_SUMMARY
           fi
