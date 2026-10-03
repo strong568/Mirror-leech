@@ -1,0 +1,297 @@
+name: GDrive Direct Clone bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Google Drive File hoặc Folder URL nguồn"
+        required: true
+      dest_folder:
+        description: "Tên thư mục đích trên Google Drive của bạn (VD: Mirror-Leech hoặc ID thư mục)"
+        required: false
+        default: "Mirror-Leech"
+
+jobs:
+  server_side_clone:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cài đặt công cụ và thư viện
+        run: |
+          sudo apt update
+          sudo apt install -y curl jq
+          curl -s https://rclone.org/install.sh | sudo bash
+          pip install --no-cache-dir \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib \
+            tenacity \
+            gdown
+
+      - name: Thiết lập cấu hình Rclone
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if [ -n "$RCLONE_CONFIG_DATA" ]; then
+            mkdir -p ~/.config/rclone
+            echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+          fi
+
+      - name: Chạy Script Python Clone (Server-side API)
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+          SA_JSON_DATA: ${{ secrets.GDRIVE_SA_JSON }} # Tùy chọn nếu dùng Service Account
+          SOURCE_URL: ${{ github.event.inputs.source_url }}
+          DEST_FOLDER: ${{ github.event.inputs.dest_folder }}
+        run: |
+          cat << 'EOF' > clone_runner.py
+          import os
+          import re
+          import sys
+          import json
+          import time
+          import subprocess
+          from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
+          from google.oauth2.credentials import Credentials
+          from google.oauth2 import service_account
+
+          G_DRIVE_DIR_MIME_TYPE = "application/vnd.google-apps.folder"
+
+          def get_drive_service():
+              # 1. Ưu tiên kiểm tra nếu có Service Account JSON
+              sa_json = os.environ.get("SA_JSON_DATA")
+              if sa_json and sa_json.strip():
+                  try:
+                      sa_info = json.loads(sa_json)
+                      creds = service_account.Credentials.from_service_account_info(
+                          sa_info, scopes=['https://www.googleapis.com/auth/drive']
+                      )
+                      return build('drive', 'v3', credentials=creds)
+                  except Exception as e:
+                      print(f"⚠️ Không thể xác thực bằng SA: {e}")
+
+              # 2. Lấy trực tiếp access token còn hạn từ rclone backend
+              print("🔑 Đang lấy Access Token từ Rclone...")
+              try:
+                  token_proc = subprocess.run(
+                      ["rclone", "backend", "token", "gdrive:"],
+                      capture_output=True,
+                      text=True,
+                      check=True
+                  )
+                  token_json = json.loads(token_proc.stdout)
+                  access_token = token_json.get("access_token")
+                  if not access_token:
+                      raise ValueError("Không tìm thấy access_token từ lệnh rclone backend token.")
+                  
+                  creds = Credentials(token=access_token)
+                  return build('drive', 'v3', credentials=creds)
+              except subprocess.CalledProcessError as e:
+                  print(f"❌ Lỗi khi gọi rclone backend token: {e.stderr}")
+                  raise e
+
+          def extract_id(url):
+              match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
+              if match:
+                  return match.group(1)
+              match = re.search(r'/(?:folders|file/d|d)/([a-zA-Z0-9_-]+)', url)
+              if match:
+                  return match.group(1)
+              return url.strip().split('/')[-1]
+
+          def human_readable_size(size_bytes):
+              if size_bytes == 0:
+                  return "0 B"
+              size_name = ("B", "KB", "MB", "GB", "TB")
+              i = 0
+              p = float(size_bytes)
+              while p >= 1024 and i < len(size_name) - 1:
+                  p /= 1024.0
+                  i += 1
+              return f"{p:.2f} {size_name[i]}"
+
+          class DriveCloner:
+              def __init__(self, service):
+                  self.service = service
+                  self.total_files = 0
+                  self.total_folders = 0
+                  self.total_bytes = 0
+                  self.file_details = []
+
+              def get_or_create_destination(self, dest_name_or_id):
+                  # Kiểm tra nếu input là Folder ID hợp lệ
+                  try:
+                      meta = self.service.files().get(
+                          fileId=dest_name_or_id,
+                          fields="id, mimeType",
+                          supportsAllDrives=True
+                      ).execute()
+                      if meta.get("mimeType") == G_DRIVE_DIR_MIME_TYPE:
+                          return meta.get("id")
+                  except Exception:
+                      pass
+
+                  # Tìm thư mục theo tên tại root
+                  query = f"mimeType = '{G_DRIVE_DIR_MIME_TYPE}' and name = '{dest_name_or_id}' and trashed = false"
+                  res = self.service.files().list(
+                      q=query, spaces='drive', fields='files(id, name)', supportsAllDrives=True, includeItemsFromAllDrives=True
+                  ).execute()
+                  files = res.get('files', [])
+                  if files:
+                      return files[0]['id']
+
+                  return self.create_directory(dest_name_or_id, "root")
+
+              def create_directory(self, name, parent_id):
+                  body = {
+                      'name': name,
+                      'mimeType': G_DRIVE_DIR_MIME_TYPE,
+                      'parents': [parent_id] if parent_id != "root" else []
+                  }
+                  folder = self.service.files().create(
+                      body=body, fields='id', supportsAllDrives=True
+                  ).execute()
+                  return folder.get('id')
+
+              def get_metadata(self, file_id):
+                  return self.service.files().get(
+                      fileId=file_id,
+                      fields="id, name, mimeType, size",
+                      supportsAllDrives=True
+                  ).execute()
+
+              def get_files_in_folder(self, folder_id):
+                  files = []
+                  page_token = None
+                  query = f"'{folder_id}' in parents and trashed = false"
+                  while True:
+                      res = self.service.files().list(
+                          q=query,
+                          fields="nextPageToken, files(id, name, mimeType, size)",
+                          pageToken=page_token,
+                          pageSize=1000,
+                          supportsAllDrives=True,
+                          includeItemsFromAllDrives=True
+                      ).execute()
+                      files.extend(res.get('files', []))
+                      page_token = res.get('nextPageToken')
+                      if not page_token:
+                          break
+                  return files
+
+              @retry(
+                  wait=wait_exponential(multiplier=2, min=3, max=8),
+                  stop=stop_after_attempt(5),
+                  retry=retry_if_exception_type(Exception),
+              )
+              def copy_file(self, file_id, dest_id):
+                  body = {'parents': [dest_id]}
+                  return self.service.files().copy(
+                      fileId=file_id,
+                      body=body,
+                      supportsAllDrives=True,
+                      fields="id, name, size"
+                  ).execute()
+
+              def clone_folder(self, folder_name, folder_id, dest_parent_id):
+                  print(f"📁 Bắt đầu duyệt thư mục: {folder_name}")
+                  items = self.get_files_in_folder(folder_id)
+                  for item in items:
+                      if item.get("mimeType") == G_DRIVE_DIR_MIME_TYPE:
+                          self.total_folders += 1
+                          sub_folder_id = self.create_directory(item.get("name"), dest_parent_id)
+                          self.clone_folder(item.get("name"), item.get("id"), sub_folder_id)
+                      else:
+                          self.total_files += 1
+                          copied = self.copy_file(item.get("id"), dest_parent_id)
+                          file_size = int(item.get("size", 0))
+                          self.total_bytes += file_size
+                          self.file_details.append((copied.get("name"), file_size, copied.get("id")))
+                          print(f"  └─ Đã sao chép: {copied.get('name')} ({human_readable_size(file_size)})")
+
+              def clone(self, source_url, dest_folder_input):
+                  target_id = extract_id(source_url)
+                  meta = self.get_metadata(target_id)
+                  mime_type = meta.get("mimeType")
+                  name = meta.get("name")
+
+                  dest_id = self.get_or_create_destination(dest_folder_input)
+
+                  if mime_type == G_DRIVE_DIR_MIME_TYPE:
+                      dest_dir_id = self.create_directory(name, dest_id)
+                      self.clone_folder(name, target_id, dest_dir_id)
+                      final_dest_id = dest_dir_id
+                  else:
+                      self.total_files = 1
+                      copied = self.copy_file(target_id, dest_id)
+                      file_size = int(meta.get("size", 0))
+                      self.total_bytes = file_size
+                      self.file_details.append((copied.get("name"), file_size, copied.get("id")))
+                      final_dest_id = dest_id
+
+                  return name, final_dest_id
+
+          def main():
+              source_url = os.environ.get("SOURCE_URL")
+              dest_folder = os.environ.get("DEST_FOLDER", "Mirror-Leech")
+
+              service = get_drive_service()
+              cloner = DriveCloner(service)
+
+              print("🚀 Đang chạy Server-Side Clone qua Google Drive API...")
+              name, final_dest_id = cloner.clone(source_url, dest_folder)
+
+              # Xuất danh sách file ra markdown tóm tắt
+              with open("summary_output.md", "w", encoding="utf-8") as f:
+                  for fname, fsize, fid in cloner.file_details:
+                      f.write(f"- 📄 **{fname}** ({human_readable_size(fsize)}) - [👉 Mở file](https://drive.google.com/file/d/{fid}/view?usp=sharing)\n")
+
+              # Ghi biến môi trường cho bước Workflow Summary
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_f:
+                  env_f.write(f"INPUT_NAME={name}\n")
+                  env_f.write(f"INPUT_SIZE={human_readable_size(cloner.total_bytes)}\n")
+                  env_f.write(f"TOTAL_FILES={cloner.total_files}\n")
+                  env_f.write(f"TOTAL_FOLDERS={cloner.total_folders}\n")
+                  env_f.write(f"DEST_LINK=https://drive.google.com/drive/folders/{final_dest_id}\n")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          python clone_runner.py
+
+      - name: Workflow Summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            {
+              echo "### ✅ Hoàn tất sao chép sang Google Drive (Server-Side Direct)"
+              echo ""
+              echo "#### 📥 Nguồn (Input):"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- **Tên nguồn:** \`${INPUT_NAME}\`"
+              echo "- **Dung lượng tổng:** \`${INPUT_SIZE}\`"
+              echo "- **Số file:** \`${TOTAL_FILES}\` | **Số thư mục:** \`${TOTAL_FOLDERS}\`"
+              echo ""
+              echo "#### 📤 Đích đến (Output):"
+              if [ -n "${DEST_LINK:-}" ]; then
+                echo "- **Link thư mục đích:** [Mở thư mục trên Google Drive](${DEST_LINK})"
+              fi
+              echo ""
+              echo "##### 📄 Danh sách file đã nhân bản:"
+              cat summary_output.md 2>/dev/null || echo "Không có file nào."
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            {
+              echo "### ❌ Thao tác sao chép thất bại"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- Kiểm tra lại quyền truy cập link nguồn, quota Drive API hoặc nội dung secret \`RCLONE_CONFIG\`."
+            } >> $GITHUB_STEP_SUMMARY
+          fi
