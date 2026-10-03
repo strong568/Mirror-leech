@@ -119,19 +119,14 @@ jobs:
             fi
           else
             ACTUAL_DEST_PATH="${DEST}"
+
+            # Lấy Folder ID chuẩn xác bằng lsjson
+            DEST_FOLDER_ID=$(rclone lsjson "gdrive:" --dirs-only 2>/dev/null | jq -r ".[] | select(.Path==\"${DEST}\") | .ID" | head -n 1 | tr -d ' \n\r')
             ACCESS_TOKEN=$(rclone backend token gdrive: 2>/dev/null | jq -r '.access_token // empty')
-            DEST_FOLDER_ID=$(rclone backend fileid gdrive: "${DEST}" 2>/dev/null | tr -d ' \n\r')
-            if [ -z "$DEST_FOLDER_ID" ] \vert{}\vert{} [ "$DEST_FOLDER_ID" = "Root" ]; then
-              DEST_FOLDER_ID=$(rclone lsjson "gdrive:" --dirs-only 2>/dev/null | jq -r ".[] | select(.Path==\"${DEST}\") | .ID" | head -n 1 | tr -d ' \n\r')
-            fi
 
-            if [ -n "$ACCESS_TOKEN" ]; then
-              if [ -n "$DEST_FOLDER_ID" ] && [ "$DEST_FOLDER_ID" != "Root" ]; then
-                REQ_BODY=$(jq -n --arg pid "$DEST_FOLDER_ID" --arg name "$INPUT_NAME" '{parents: [$pid], name:$name}')
-              else
-                REQ_BODY=$(jq -n --arg name "$INPUT_NAME" '{name: $name}')
-              fi
-
+            # Cách 1: Copy trực tiếp qua Drive REST API v3 kèm parent ID
+            if [ -n "$ACCESS_TOKEN" ] && [ -n "$DEST_FOLDER_ID" ]; then
+              REQ_BODY=$(jq -n --arg pid "$DEST_FOLDER_ID" --arg name "$INPUT_NAME" '{"parents": [$pid], "name": $name}')
               API_RESP=$(curl -s -X POST \
                 -H "Authorization: Bearer ${ACCESS_TOKEN}" \
                 -H "Content-Type: application/json; charset=UTF-8" \
@@ -142,19 +137,22 @@ jobs:
               if [ -n "$COPIED_FILE_ID" ]; then
                 COPIED_SUCCESS=1
                 METHOD_USED="Server-Side Direct (Drive API Copy)"
-                echo "🎉 Nhân bản thành công tức thì với File ID: $COPIED_FILE_ID"
+                echo "🎉 Nhân bản thành công tức thì vào thư mục đích!"
               fi
             fi
 
+            # Cách 2 (Dự phòng): Dùng rclone copyto trực tiếp với root_folder_id
             if [ "$COPIED_SUCCESS" -ne 1 ]; then
-              rclone backend copyid gdrive: "$TARGET_ID" "gdrive:${INPUT_NAME}" > copy.log 2>&1 || true
-              if [ -s copy.log ] && ! grep -qiE "failed|error" copy.log; then
-                rclone move "gdrive:${INPUT_NAME}" "gdrive:${DEST}/" 2>/dev/null || true
+              echo "🔄 Thử lại với rclone copyto..."
+              if rclone copyto "gdrive,root_folder_id=${TARGET_ID}:" "gdrive:${DEST}/${INPUT_NAME}" \
+                  --drive-server-side-across-configs \
+                  --drive-acknowledge-abuse; then
                 COPIED_SUCCESS=1
-                METHOD_USED="Server-Side Direct (rclone copyid)"
+                METHOD_USED="Server-Side Direct (rclone copyto)"
               fi
             fi
           fi
+
 
           # 5. Fallback tải qua máy ảo nếu bị chặn Server-Side
           if [ "$COPIED_SUCCESS" -eq 1 ]; then
