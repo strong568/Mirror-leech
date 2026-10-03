@@ -25,14 +25,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y curl jq
-          pip install --no-cache-dir \
-            google-api-python-client \
-            google-auth \
-            google-auth-httplib2 \
-            google-auth-oauthlib \
-            tenacity \
-            requests \
-            gdown
+          curl -s https://rclone.org/install.sh | sudo bash
+          pip install --no-cache-dir gdown
 
       - name: Thiết lập cấu hình Rclone
         env:
@@ -44,90 +38,90 @@ jobs:
           fi
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+          # Tự động phát hiện tên remote Drive đầu tiên trong file rclone.conf
+          REMOTE_NAME=$(sed -n 's/^\[\(.*\)\]/\1/p' ~/.config/rclone/rclone.conf | head -n 1)
+          if [ -z "$REMOTE_NAME" ]; then
+            REMOTE_NAME="gdrive"
+          fi
+          echo "REMOTE_NAME=$REMOTE_NAME" >> $GITHUB_ENV
+          echo "🔍 Sử dụng Remote Rclone: $REMOTE_NAME"
 
-      - name: Chạy Script Python Clone (Server-side + Fallback Bypass)
+      - name: Thực thi sao chép & Bypass Quota
         env:
-          SA_JSON_DATA: ${{ secrets.GDRIVE_SA_JSON }}
           SOURCE_URL: ${{ github.event.inputs.source_url }}
           DEST_FOLDER: ${{ github.event.inputs.dest_folder }}
         run: |
-          cat << 'EOF' > clone_runner.py
-          import os
-          import re
-          import io
-          import sys
-          import json
-          import configparser
-          from googleapiclient.discovery import build
-          from googleapiclient.errors import HttpError
-          from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-          from google.oauth2.credentials import Credentials
-          from google.oauth2 import service_account
-          from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+          # 1. Trích xuất ID sạch từ URL
+          CLEAN_URL="${SOURCE_URL%%\?*}"
+          TARGET_ID=$(echo "$CLEAN_URL" | grep -oE '[a-zA-Z0-9_-]{25,}' | tail -1)
+          if [ -z "$TARGET_ID" ]; then
+            TARGET_ID=$(echo "$SOURCE_URL" | sed -n 's/.*id=\([a-zA-Z0-9_-]*\).*/\1/p')
+          fi
 
-          G_DRIVE_DIR_MIME_TYPE = "application/vnd.google-apps.folder"
+          if [ -z "$TARGET_ID" ]; then
+            echo "❌ Không trích xuất được Google Drive ID từ URL: $SOURCE_URL"
+            exit 1
+          fi
 
-          def get_drive_service():
-              sa_json = os.environ.get("SA_JSON_DATA")
-              if sa_json and sa_json.strip():
-                  try:
-                      sa_info = json.loads(sa_json)
-                      creds = service_account.Credentials.from_service_account_info(
-                          sa_info, scopes=['https://www.googleapis.com/auth/drive']
-                      )
-                      print("🔑 Đã xác thực bằng Service Account JSON.")
-                      return build('drive', 'v3', credentials=creds)
-                  except Exception as e:
-                      print(f"⚠️ Thất bại khi đọc SA: {e}. Đang chuyển sang rclone.conf...")
+          echo "🎯 Target ID: $TARGET_ID"
+          echo "📁 Thư mục đích: $DEST_FOLDER"
+          mkdir -p workdir
 
-              conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
-              if not os.path.exists(conf_path):
-                  raise FileNotFoundError(f"Không tìm thấy file cấu hình tại {conf_path}")
+          # 2. Tạo thư mục đích trên Google Drive
+          rclone mkdir "${REMOTE_NAME}:${DEST_FOLDER}"
 
-              config = configparser.ConfigParser()
-              config.read(conf_path, encoding="utf-8")
+          # 3. Phương thức 1: Server-side Copy qua backend copyid (Hỗ trợ cả File đơn lẻ)
+          echo "🚀 [Phương thức 1] Thử nghiệm Server-side copy trực tiếp..."
+          SUCCESS=0
+          if rclone backend copyid "${REMOTE_NAME}:" "$TARGET_ID" "${REMOTE_NAME}:${DEST_FOLDER}" 2>&1 | tee copyid.log; then
+            if ! grep -qi "error" copyid.log; then
+              echo "✅ Sao chép thành công qua Rclone Backend copyid!"
+              SUCCESS=1
+            fi
+          fi
 
-              remote_name = "gdrive" if "gdrive" in config else None
-              if not remote_name:
-                  for section in config.sections():
-                      if config[section].get("type") == "drive":
-                          remote_name = section
-                          break
+          # 4. Phương thức 2: Server-side Folder Copy (Nếu nguồn là Folder)
+          if [ $SUCCESS -eq 0 ]; then
+            echo "🔄 [Phương thức 2] Thử nghiệm Server-side Folder clone..."
+            if rclone copy "${REMOTE_NAME},root_folder_id=${TARGET_ID}:" "${REMOTE_NAME}:${DEST_FOLDER}" \
+                --drive-server-side-copy \
+                --drive-acknowledge-abuse \
+                --fast-list \
+                -v; then
+              echo "✅ Sao chép Folder Server-side thành công!"
+              SUCCESS=1
+            fi
+          fi
 
-              if not remote_name:
-                  raise ValueError("Không tìm thấy remote Google Drive (type = drive) trong rclone.conf!")
+          # 5. Phương thức 3: Bypass Quota Exceeded qua gdown và đồng bộ ngược lên Drive
+          if [ $SUCCESS -eq 0 ]; then
+            echo "⚠️ [Phương thức 3] Kích hoạt chế độ Bypass Quota Exceeded qua VM Relay..."
+            cd workdir
+            
+            # gdown hỗ trợ tải file vượt hạn mức hoặc link chia sẻ bị nghẽn
+            gdown --fuzzy "$SOURCE_URL" --continue \vert{}\vert{} gdown --id "$TARGET_ID" --continue
 
-              sec = config[remote_name]
-              token_str = sec.get("token")
-              if not token_str:
-                  raise ValueError(f"Không tìm thấy trường 'token' trong section [{remote_name}]")
+            DOWNLOADED_FILES=$(ls -A .)
+            if [ -n "$DOWNLOADED_FILES" ]; then
+              echo "📦 File đã tải về VM, đang đẩy lên Google Drive..."
+              rclone move . "${REMOTE_NAME}:${DEST_FOLDER}/" -v --drive-chunk-size 64M
+              SUCCESS=1
+            else
+              echo "❌ Thất bại: Không thể tải file qua cơ chế Bypass."
+              exit 1
+            fi
+            cd ..
+          fi
 
-              token_data = json.loads(token_str)
-              creds = Credentials(
-                  token=token_data.get("access_token"),
-                  refresh_token=token_data.get("refresh_token"),
-                  token_uri="https://oauth2.googleapis.com/token",
-                  client_id=sec.get("client_id"),
-                  client_secret=sec.get("client_secret"),
-                  scopes=['https://www.googleapis.com/auth/drive']
-              )
-
-              return build('drive', 'v3', credentials=creds)
-
-          def extract_id(url):
-              url = url.strip()
-              match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
-              if match:
-                  return match.group(1)
-              match = re.search(r'/(?:folders|file/d|d)/([a-zA-Z0-9_-]+)', url)
-              if match:
-                  return match.group(1)
-              clean_url = url.split('?')[0].rstrip('/')
-              return clean_url.split('/')[-1]
+          # 6. Lấy thống kê kết quả để hiển thị ra Summary
+          echo "📊 Đang truy xuất danh sách file trong thư mục đích..."
+          rclone lsjson "${REMOTE_NAME}:${DEST_FOLDER}" > files_result.json
+          
+          python3 - << 'PYEOF'
+          import json, os
 
           def human_readable_size(size_bytes):
-              if size_bytes == 0:
-                  return "0 B"
+              if not size_bytes: return "0 B"
               size_name = ("B", "KB", "MB", "GB", "TB")
               i = 0
               p = float(size_bytes)
@@ -136,111 +130,53 @@ jobs:
                   i += 1
               return f"{p:.2f} {size_name[i]}"
 
-          class DriveCloner:
-              def __init__(self, service):
-                  self.service = service
-                  self.total_files = 0
-                  self.total_folders = 0
-                  self.total_bytes = 0
-                  self.file_details = []
+          try:
+              with open("files_result.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              
+              total_bytes = sum(item.get("Size", 0) for item in data if not item.get("IsDir"))
+              total_files = sum(1 for item in data if not item.get("IsDir"))
+              total_dirs = sum(1 for item in data if item.get("IsDir"))
 
-              def get_or_create_destination(self, dest_name_or_id):
-                  try:
-                      meta = self.service.files().get(
-                          fileId=dest_name_or_id,
-                          fields="id, mimeType",
-                          supportsAllDrives=True
-                      ).execute()
-                      if meta.get("mimeType") == G_DRIVE_DIR_MIME_TYPE:
-                          return meta.get("id")
-                  except Exception:
-                      pass
+              with open("summary_output.md", "w", encoding="utf-8") as f:
+                  for item in data:
+                      if not item.get("IsDir"):
+                          f.write(f"- 📄 **{item.get('Name')}** ({human_readable_size(item.get('Size', 0))})\n")
 
-                  query = f"mimeType = '{G_DRIVE_DIR_MIME_TYPE}' and name = '{dest_name_or_id}' and trashed = false"
-                  res = self.service.files().list(
-                      q=query, spaces='drive', fields='files(id, name)', supportsAllDrives=True, includeItemsFromAllDrives=True
-                  ).execute()
-                  files = res.get('files', [])
-                  if files:
-                      return files[0]['id']
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_f:
+                  env_f.write(f"TOTAL_SIZE={human_readable_size(total_bytes)}\n")
+                  env_f.write(f"TOTAL_FILES={total_files}\n")
+                  env_f.write(f"TOTAL_DIRS={total_dirs}\n")
+          except Exception as e:
+              print(f"Error parsing json: {e}")
+          PYEOF
 
-                  return self.create_directory(dest_name_or_id, "root")
-
-              def create_directory(self, name, parent_id):
-                  body = {
-                      'name': name,
-                      'mimeType': G_DRIVE_DIR_MIME_TYPE,
-                      'parents': [parent_id] if parent_id != "root" else []
-                  }
-                  folder = self.service.files().create(
-                      body=body, fields='id', supportsAllDrives=True
-                  ).execute()
-                  return folder.get('id')
-
-              def get_metadata(self, file_id):
-                  return self.service.files().get(
-                      fileId=file_id,
-                      fields="id, name, mimeType, size",
-                      supportsAllDrives=True
-                  ).execute()
-
-              def get_files_in_folder(self, folder_id):
-                  files = []
-                  page_token = None
-                  query = f"'{folder_id}' in parents and trashed = false"
-                  while True:
-                      res = self.service.files().list(
-                          q=query,
-                          fields="nextPageToken, files(id, name, mimeType, size)",
-                          pageToken=page_token,
-                          pageSize=1000,
-                          supportsAllDrives=True,
-                          includeItemsFromAllDrives=True
-                      ).execute()
-                      files.extend(res.get('files', []))
-                      page_token = res.get('nextPageToken')
-                      if not page_token:
-                          break
-                  return files
-
-              def download_and_upload_fallback(self, file_id, file_name, dest_id):
-                  """Tải và upload qua mạng VM khi Google chặn API copy trực tiếp"""
-                  print(f"  ⚡ File bị dính Rate Limit, kích hoạt chế độ Relay Download -> Upload qua VM...")
-                  temp_path = f"/tmp/{file_id}"
-                  
-                  # Tải file từ Google Drive về máy ảo
-                  request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                  with open(temp_path, "wb") as fh:
-                      downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
-                      done = False
-                      while not done:
-                          status, done = downloader.next_chunk()
-                          if status:
-                              print(f"     [Tải về] {int(status.progress() * 100)}%", end="\r")
-
-                  print("\n     [Tải về] Hoàn tất. Đang đẩy lên thư mục đích...")
-                  
-                  # Upload file lên thư mục đích
-                  media = MediaIoBaseUpload(open(temp_path, 'rb'), mimetype='application/octet-stream', resumable=True)
-                  body = {'name': file_name, 'parents': [dest_id]}
-                  uploaded = self.service.files().create(
-                      body=body,
-                      media_body=media,
-                      fields='id, name, size',
-                      supportsAllDrives=True
-                  ).execute()
-
-                  if os.path.exists(temp_path):
-                      os.remove(temp_path)
-
-                  return uploaded
-
-              def copy_file_safe(self, file_id, dest_id, file_name=None):
-                  # Thử Server-Side Copy trước
-                  try:
-                      body = {'parents': [dest_id]}
-                      return self.service.files().copy(
-                          fileId=file_id,
+      - name: Workflow Summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            {
+              echo "### ✅ Hoàn tất sao chép sang Google Drive"
+              echo ""
+              echo "#### 📥 Nguồn (Input):"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- **Dung lượng tổng:** \`${TOTAL_SIZE:-Không xác định}\`"
+              echo "- **Số file:** \`${TOTAL_FILES:-0}\` | **Số thư mục:** \`${TOTAL_DIRS:-0}\`"
+              echo ""
+              echo "#### 📤 Đích đến (Output):"
+              echo "- **Thư mục đích:** \`${{ github.event.inputs.dest_folder }}\`"
+              echo ""
+              echo "##### 📄 Danh sách file:"
+              cat summary_output.md 2>/dev/null || echo "Hoàn tất chuyển đổi dữ liệu."
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            {
+              echo "### ❌ Quá trình sao chép thất bại"
+              echo "- **URL nguồn:** [${{ github.event.inputs.source_url }}](${{ github.event.inputs.source_url }})"
+              echo "- File bị khóa bản quyền gắt gao hoặc tài khoản Drive đích không còn đủ dung lượng trống."
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+       fileId=file_id,
                           body=body,
                           supportsAllDrives=True,
                           fields="id, name, size"
